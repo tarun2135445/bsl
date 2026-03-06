@@ -2,9 +2,11 @@
 BSL (British Sign Language) Recognition System
 ================================================
 Modes:
-  collect  - Capture hand landmark data for a sign label
-  train    - Train the classifier on collected data
+  collect   - Capture hand landmark data for a sign label
+  train     - Train the classifier on collected data
   recognize - Live recognition from webcam
+  list      - Show sample counts per label
+  delete    - Remove all samples for a label
 
 Usage:
   python bsl_recognition.py collect --label A --samples 200
@@ -18,6 +20,8 @@ import os
 import pickle
 import sys
 import time
+import urllib.request
+from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -29,26 +33,62 @@ import numpy as np
 DATA_DIR = Path("data")
 DATA_FILE = DATA_DIR / "landmarks.csv"
 MODEL_FILE = Path("bsl_model.pkl")
+LANDMARK_MODEL = Path("hand_landmarker.task")
+LANDMARK_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+)
 
-# ─── MediaPipe setup ──────────────────────────────────────────────────────────
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
+# ─── MediaPipe Tasks API shortcuts ────────────────────────────────────────────
+HandLandmarker = mp.tasks.vision.HandLandmarker
+HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+RunningMode = mp.tasks.vision.RunningMode
+BaseOptions = mp.tasks.BaseOptions
 
-NUM_LANDMARKS = 21          # MediaPipe gives 21 hand landmarks
-FEATURES_PER_HAND = NUM_LANDMARKS * 2   # x, y (normalised; z is noisy with webcam)
+NUM_LANDMARKS = 21
+FEATURES_PER_HAND = NUM_LANDMARKS * 2  # normalised (x-wrist, y-wrist)
+
+# Hand skeleton connections for manual drawing
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),          # thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),           # index
+    (0, 9), (9, 10), (10, 11), (11, 12),      # middle
+    (0, 13), (13, 14), (14, 15), (15, 16),    # ring
+    (0, 17), (17, 18), (18, 19), (19, 20),    # pinky
+    (5, 9), (9, 13), (13, 17),                # palm knuckles
+]
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def extract_features(hand_landmarks, frame_w, frame_h):
-    """Return a flat list of normalised (x, y) coords relative to wrist."""
-    wrist = hand_landmarks.landmark[0]
+def ensure_landmark_model():
+    """Download the MediaPipe hand landmark model if not already present."""
+    if LANDMARK_MODEL.exists():
+        return
+    print(f"[INFO] Downloading hand landmark model from Google MediaPipe storage...")
+    urllib.request.urlretrieve(LANDMARK_MODEL_URL, LANDMARK_MODEL)
+    print(f"[INFO] Saved to {LANDMARK_MODEL}")
+
+
+def extract_features(hand_landmarks):
+    """Return a flat list of (x-wrist, y-wrist) normalised coordinates."""
+    wrist_x = hand_landmarks[0].x
+    wrist_y = hand_landmarks[0].y
     coords = []
-    for lm in hand_landmarks.landmark:
-        coords.append(lm.x - wrist.x)
-        coords.append(lm.y - wrist.y)
+    for lm in hand_landmarks:
+        coords.append(lm.x - wrist_x)
+        coords.append(lm.y - wrist_y)
     return coords
+
+
+def draw_landmarks(frame, hand_landmarks, h, w):
+    """Draw hand skeleton on the frame."""
+    pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(frame, pts[a], pts[b], (0, 220, 130), 2)
+    for x, y in pts:
+        cv2.circle(frame, (x, y), 4, (255, 255, 255), -1)
+        cv2.circle(frame, (x, y), 4, (0, 180, 100), 1)
 
 
 def draw_info(frame, text, pos=(10, 30), color=(0, 255, 0), size=0.9, thickness=2):
@@ -70,9 +110,9 @@ def open_camera(camera_index=0):
 
 def collect(label: str, n_samples: int, camera_index: int, delay: float):
     """Capture hand landmarks and append them to the CSV dataset."""
+    ensure_landmark_model()
     DATA_DIR.mkdir(exist_ok=True)
 
-    # Write CSV header if file is new
     write_header = not DATA_FILE.exists()
     csv_fp = open(DATA_FILE, "a", newline="")
     writer = csv.writer(csv_fp)
@@ -81,68 +121,66 @@ def collect(label: str, n_samples: int, camera_index: int, delay: float):
         writer.writerow(header)
 
     cap = open_camera(camera_index)
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.6,
+    options = HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(LANDMARK_MODEL)),
+        running_mode=RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=0.6,
         min_tracking_confidence=0.5,
     )
 
     collected = 0
     collecting = False
-    countdown_start = None
+    frame_ts = 0
 
     print(f"\n[COLLECT] Label: '{label}'  Target samples: {n_samples}")
     print("  Press SPACE to start/pause collection, Q to quit early.\n")
 
-    while collected < n_samples:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    with HandLandmarker.create_from_options(options) as landmarker:
+        while collected < n_samples:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        frame = cv2.flip(frame, 1)
-        h, w, _ = frame.shape
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = hands.process(rgb)
+            frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
+            frame_ts += 33  # ~30 fps in ms
 
-        hand_detected = False
-        if results.multi_hand_landmarks:
-            hand_detected = True
-            for hl in results.multi_hand_landmarks:
-                mp_drawing.draw_landmarks(
-                    frame, hl, mp_hands.HAND_CONNECTIONS,
-                    mp_drawing_styles.get_default_hand_landmarks_style(),
-                    mp_drawing_styles.get_default_hand_connections_style(),
-                )
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            result = landmarker.detect_for_video(mp_image, frame_ts)
 
-            if collecting:
-                features = extract_features(results.multi_hand_landmarks[0], w, h)
-                writer.writerow(features + [label])
-                collected += 1
-                time.sleep(delay)
+            hand_detected = bool(result.hand_landmarks)
 
-        # HUD
-        status = "COLLECTING" if collecting else "PAUSED"
-        color = (0, 200, 0) if collecting else (0, 100, 255)
-        draw_info(frame, f"Label: {label}  [{status}]", (10, 30), color)
-        draw_info(frame, f"Samples: {collected}/{n_samples}", (10, 65))
-        if not hand_detected:
-            draw_info(frame, "No hand detected", (10, 100), (0, 0, 255))
-        draw_info(frame, "SPACE=start/pause  Q=quit", (10, h - 15), (200, 200, 200), 0.55, 1)
+            if hand_detected:
+                hl = result.hand_landmarks[0]
+                draw_landmarks(frame, hl, h, w)
 
-        # Progress bar
-        bar_w = int(w * collected / n_samples)
-        cv2.rectangle(frame, (0, h - 8), (bar_w, h), (0, 200, 0), -1)
+                if collecting:
+                    features = extract_features(hl)
+                    writer.writerow(features + [label])
+                    collected += 1
+                    time.sleep(delay)
 
-        cv2.imshow("BSL - Collect", frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord(" "):
-            collecting = not collecting
+            status = "COLLECTING" if collecting else "PAUSED"
+            color = (0, 200, 0) if collecting else (0, 100, 255)
+            draw_info(frame, f"Label: {label}  [{status}]", (10, 30), color)
+            draw_info(frame, f"Samples: {collected}/{n_samples}", (10, 65))
+            if not hand_detected:
+                draw_info(frame, "No hand detected", (10, 100), (0, 0, 255))
+            draw_info(frame, "SPACE=start/pause  Q=quit", (10, h - 15), (200, 200, 200), 0.55, 1)
+
+            bar_w = int(w * collected / n_samples)
+            cv2.rectangle(frame, (0, h - 8), (bar_w, h), (0, 200, 0), -1)
+
+            cv2.imshow("BSL - Collect", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord(" "):
+                collecting = not collecting
 
     csv_fp.close()
-    hands.close()
     cap.release()
     cv2.destroyAllWindows()
     print(f"[COLLECT] Done. {collected} samples saved for '{label}' → {DATA_FILE}")
@@ -162,22 +200,24 @@ def train():
     from sklearn.metrics import classification_report
 
     print(f"[TRAIN] Loading data from {DATA_FILE} ...")
-    data = np.genfromtxt(DATA_FILE, delimiter=",", dtype=None, encoding="utf-8", names=True)
+    raw = np.genfromtxt(DATA_FILE, delimiter=",", dtype=None, encoding="utf-8", names=True)
 
     feature_cols = [f"f{i}" for i in range(FEATURES_PER_HAND)]
-    X = np.column_stack([data[c].astype(float) for c in feature_cols])
-    y_raw = data["label"].astype(str)
+    X = np.column_stack([raw[c].astype(float) for c in feature_cols])
+    y_raw = raw["label"].astype(str)
 
     le = LabelEncoder()
     y = le.fit_transform(y_raw)
 
     classes = le.classes_
     print(f"[TRAIN] Classes ({len(classes)}): {list(classes)}")
-    print(f"[TRAIN] Samples: {len(X)}")
+    print(f"[TRAIN] Samples:  {len(X)}")
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
 
-    clf = RandomForestClassifier(n_estimators=200, max_depth=None, n_jobs=-1, random_state=42)
+    clf = RandomForestClassifier(n_estimators=200, n_jobs=-1, random_state=42)
     clf.fit(X_train, y_train)
 
     y_pred = clf.predict(X_test)
@@ -187,7 +227,7 @@ def train():
     scores = cross_val_score(clf, X, y, cv=5)
     print(f"[TRAIN] 5-fold CV accuracy: {scores.mean():.3f} ± {scores.std():.3f}")
 
-    payload = {"model": clf, "label_encoder": le, "feature_count": FEATURES_PER_HAND}
+    payload = {"model": clf, "label_encoder": le}
     with open(MODEL_FILE, "wb") as f:
         pickle.dump(payload, f)
     print(f"\n[TRAIN] Model saved → {MODEL_FILE}")
@@ -197,6 +237,8 @@ def train():
 
 def recognize(camera_index: int, confidence_threshold: float):
     """Run live BSL sign recognition from webcam."""
+    ensure_landmark_model()
+
     if not MODEL_FILE.exists():
         print(f"[ERROR] No model file found at {MODEL_FILE}. Run 'train' first.")
         sys.exit(1)
@@ -208,93 +250,80 @@ def recognize(camera_index: int, confidence_threshold: float):
     le = payload["label_encoder"]
 
     cap = open_camera(camera_index)
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.6,
+    options = HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(LANDMARK_MODEL)),
+        running_mode=RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=0.6,
         min_tracking_confidence=0.5,
     )
 
-    # Smoothing: keep a short history of predictions
     SMOOTH = 7
     pred_history = []
     last_label = ""
-    last_conf = 0.0
+    frame_ts = 0
 
     print("\n[RECOGNIZE] Press Q to quit.\n")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    with HandLandmarker.create_from_options(options) as landmarker:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        frame = cv2.flip(frame, 1)
-        h, w, _ = frame.shape
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = hands.process(rgb)
+            frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
+            frame_ts += 33
 
-        label_text = ""
-        conf_text = ""
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            result = landmarker.detect_for_video(mp_image, frame_ts)
 
-        if results.multi_hand_landmarks:
-            hl = results.multi_hand_landmarks[0]
-            mp_drawing.draw_landmarks(
-                frame, hl, mp_hands.HAND_CONNECTIONS,
-                mp_drawing_styles.get_default_hand_landmarks_style(),
-                mp_drawing_styles.get_default_hand_connections_style(),
-            )
+            if result.hand_landmarks:
+                hl = result.hand_landmarks[0]
+                draw_landmarks(frame, hl, h, w)
 
-            features = extract_features(hl, w, h)
-            proba = clf.predict_proba([features])[0]
-            top_idx = np.argmax(proba)
-            top_conf = proba[top_idx]
-            top_label = le.inverse_transform([top_idx])[0]
+                features = extract_features(hl)
+                proba = clf.predict_proba([features])[0]
+                top_idx = int(np.argmax(proba))
+                top_conf = proba[top_idx]
+                top_label = le.inverse_transform([top_idx])[0]
 
-            pred_history.append(top_label)
-            if len(pred_history) > SMOOTH:
-                pred_history.pop(0)
+                pred_history.append(top_label)
+                if len(pred_history) > SMOOTH:
+                    pred_history.pop(0)
 
-            # Majority vote over history
-            from collections import Counter
-            vote = Counter(pred_history).most_common(1)[0][0]
+                voted = Counter(pred_history).most_common(1)[0][0]
+                last_label = voted if top_conf >= confidence_threshold else "?"
 
-            if top_conf >= confidence_threshold:
-                last_label = vote
-                last_conf = top_conf
+                # Big sign box (top-right)
+                cv2.rectangle(frame, (w - 170, 0), (w, 110), (0, 0, 0), -1)
+                cv2.putText(frame, last_label, (w - 155, 90),
+                            cv2.FONT_HERSHEY_SIMPLEX, 3.5, (0, 255, 100), 5)
+                draw_info(frame, f"{top_conf*100:.1f}%", (w - 155, 128),
+                          (200, 200, 200), 0.65, 1)
+
+                # Top-3 bar chart
+                sorted_idx = np.argsort(proba)[::-1][:3]
+                for rank, idx in enumerate(sorted_idx):
+                    lbl = le.inverse_transform([idx])[0]
+                    bar_len = int(220 * proba[idx])
+                    y_off = h - 95 + rank * 30
+                    cv2.rectangle(frame, (10, y_off), (10 + bar_len, y_off + 22),
+                                  (0, 160, 255), -1)
+                    draw_info(frame, f"{lbl}: {proba[idx]*100:.1f}%",
+                              (14, y_off + 17), (255, 255, 255), 0.56, 1)
             else:
-                last_label = "?"
-                last_conf = top_conf
+                draw_info(frame, "Show your hand to the camera", (10, 55), (0, 150, 255))
+                pred_history.clear()
 
-            label_text = last_label
-            conf_text = f"{last_conf * 100:.1f}%"
+            draw_info(frame, "BSL Sign Recognition", (10, 30))
+            draw_info(frame, "Q = quit", (10, h - 10), (180, 180, 180), 0.5, 1)
 
-            # Big sign display
-            cv2.rectangle(frame, (w - 160, 0), (w, 100), (0, 0, 0), -1)
-            cv2.putText(frame, label_text, (w - 145, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 3.2, (0, 255, 100), 5)
-            draw_info(frame, f"Conf: {conf_text}", (w - 155, 120), (200, 200, 200), 0.6, 1)
+            cv2.imshow("BSL - Recognize", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
-            # Top-3 predictions
-            sorted_idx = np.argsort(proba)[::-1][:3]
-            for rank, idx in enumerate(sorted_idx):
-                lbl = le.inverse_transform([idx])[0]
-                bar_len = int(200 * proba[idx])
-                y_off = h - 90 + rank * 28
-                cv2.rectangle(frame, (10, y_off), (10 + bar_len, y_off + 20), (0, 180, 255), -1)
-                draw_info(frame, f"{lbl}: {proba[idx]*100:.1f}%",
-                          (15, y_off + 16), (255, 255, 255), 0.55, 1)
-        else:
-            draw_info(frame, "Show your hand to the camera", (10, 50), (0, 150, 255))
-            pred_history.clear()
-
-        draw_info(frame, "BSL Sign Recognition", (10, 30))
-        draw_info(frame, "Q = quit", (10, h - 10), (200, 200, 200), 0.5, 1)
-
-        cv2.imshow("BSL - Recognize", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    hands.close()
     cap.release()
     cv2.destroyAllWindows()
 
@@ -302,13 +331,13 @@ def recognize(camera_index: int, confidence_threshold: float):
 # ─── Mode: list ───────────────────────────────────────────────────────────────
 
 def list_labels():
-    """Show how many samples exist per label in the dataset."""
     if not DATA_FILE.exists():
         print(f"No dataset found at {DATA_FILE}.")
         return
-    from collections import Counter
-    data = np.genfromtxt(DATA_FILE, delimiter=",", dtype=str, skip_header=0)
-    labels = data[1:, -1]   # last column, skip header row
+    with open(DATA_FILE, "r") as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+        labels = [row[-1] for row in reader]
     counts = Counter(labels)
     print(f"\nDataset: {DATA_FILE}  ({sum(counts.values())} total samples)\n")
     print(f"{'Label':<20} {'Samples':>8}")
@@ -321,18 +350,15 @@ def list_labels():
 # ─── Mode: delete ─────────────────────────────────────────────────────────────
 
 def delete_label(label: str):
-    """Remove all samples for a given label from the CSV."""
     if not DATA_FILE.exists():
         print("No dataset found.")
         return
     tmp = DATA_DIR / "_tmp.csv"
-    kept = 0
-    removed = 0
+    kept = removed = 0
     with open(DATA_FILE, "r") as fin, open(tmp, "w", newline="") as fout:
         reader = csv.reader(fin)
         writer = csv.writer(fout)
-        header = next(reader)
-        writer.writerow(header)
+        writer.writerow(next(reader))  # header
         for row in reader:
             if row[-1] == label:
                 removed += 1
@@ -352,26 +378,22 @@ def main():
     )
     sub = parser.add_subparsers(dest="mode", required=True)
 
-    # collect
     p_col = sub.add_parser("collect", help="Record hand landmark samples for a sign")
     p_col.add_argument("--label", required=True, help="Sign label (e.g. A, HELLO, THANK_YOU)")
-    p_col.add_argument("--samples", type=int, default=300, help="Number of samples to collect (default: 300)")
-    p_col.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
-    p_col.add_argument("--delay", type=float, default=0.05, help="Delay between frames in seconds (default: 0.05)")
+    p_col.add_argument("--samples", type=int, default=300)
+    p_col.add_argument("--camera", type=int, default=0)
+    p_col.add_argument("--delay", type=float, default=0.05,
+                       help="Delay between frames in seconds (default: 0.05)")
 
-    # train
     sub.add_parser("train", help="Train the classifier on collected data")
 
-    # recognize
     p_rec = sub.add_parser("recognize", help="Live webcam sign recognition")
     p_rec.add_argument("--camera", type=int, default=0)
     p_rec.add_argument("--confidence", type=float, default=0.5,
-                       help="Minimum confidence to display a prediction (default: 0.5)")
+                       help="Min confidence to display a prediction (default: 0.5)")
 
-    # list
     sub.add_parser("list", help="List labels and sample counts in the dataset")
 
-    # delete
     p_del = sub.add_parser("delete", help="Remove all samples for a label")
     p_del.add_argument("--label", required=True)
 
